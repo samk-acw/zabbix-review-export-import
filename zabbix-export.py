@@ -627,10 +627,13 @@ def main(
 
     if only in ("all", "scripts"):
         logging.info("Processing scripts...")
-        # Two distinct things reference files in Zabbix's ExternalScripts directory:
-        # - "External check" items/item prototypes (type 10), key_ = "scriptname[params]"
-        # - Alerts > Scripts entries of type "Script" (type 0), command = filename
-        # Both are gathered here; only the former is normally what's actually used.
+        # "External check" items/item prototypes (type 10) have a well-defined key_ format
+        # of "scriptname[params]", referencing a file in Zabbix's ExternalScripts directory.
+        # Alerts > Scripts entries of type "Script" are NOT a reliable source of a copyable
+        # filename here: their "command" field can be an absolute path, embed macros/params,
+        # or be a full shell command line (e.g. "ping -c 3 {HOST.CONN}; case $? in ...") rather
+        # than a bare filename in ExternalScripts, so they're excluded from the file copy below
+        # (the scripts JSON dump further down still captures their definitions as-is).
         EXTERNAL_CHECK_TYPE = "10"
         script_names = set()
 
@@ -644,9 +647,6 @@ def main(
             script_names.add(i["key_"].split("[", 1)[0])
 
         scripts = zabbix_.script.get(output="extend")
-        for script in scripts:
-            if str(script.get("type")) == "0":  # file-backed "Script" type
-                script_names.add(script["command"])
 
         external_scripts_dir = get_external_scripts_dir(
             server_config, external_scripts_dir_override

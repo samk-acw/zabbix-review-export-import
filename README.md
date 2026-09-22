@@ -63,17 +63,15 @@ python ./zabbix-export.py --save-yaml --directory /home/username/path/to/zabbix-
 ```
 
 ### Exporting external scripts
-Two distinct Zabbix features reference files in the server's `ExternalScripts` directory (set by
-`ExternalScripts=` in `zabbix_server.conf`, default `/usr/lib/zabbix/externalscripts`) rather than
-storing the script body in the database:
-- **External check** items/item prototypes (`key_` like `check_oracle.sh["-h","{HOST.CONN}"]`) —
-  in most setups this is what's actually populating that directory.
-- Alerts -> Scripts entries of type "Script" (as opposed to Webhook/SSH/IPMI/Telnet, which are
-  fully stored in the database already).
+**External check** items/item prototypes (`key_` like `check_oracle.sh["-h","{HOST.CONN}"]`)
+reference a file in the server's `ExternalScripts` directory (set by `ExternalScripts=` in
+`zabbix_server.conf`, default `/usr/lib/zabbix/externalscripts`) by name.
 
-`--only scripts` scans hosts, templates and LLD rules for external-check items, plus the Scripts
-table for type-"Script" entries, and copies every referenced file it can find alongside the
-Scripts table's JSON dump:
+`--only scripts` scans hosts, templates and LLD rules for external-check items and copies each
+referenced file, alongside a JSON dump of the Alerts -> Scripts table for reference. Alerts ->
+Scripts entries aren't used as a source for file copying: their `command` field can be an
+absolute path, embed macros/parameters, or be a full shell command line rather than a bare
+filename in `ExternalScripts`, so there's no reliable file to copy from it.
 ```bash
 # --zabbix-server-config defaults to /etc/zabbix/zabbix_server.conf; override with
 # --external-scripts-dir if the ExternalScripts path isn't discoverable from there
