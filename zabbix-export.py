@@ -4,16 +4,20 @@ import json
 import logging
 import os
 import re
-import sys
+import shutil
 import xml.dom.minidom
 from collections import OrderedDict
 
 import anymarkup
 import urllib3
 import yaml
-from pyzabbix import ZabbixAPI
 
-from pkg_resources import parse_version
+from zabbix_common import (
+    add_zabbix_connection_args,
+    get_zabbix_connection,
+    init_logging,
+    validate_zabbix_connection_args,
+)
 
 urllib3.disable_warnings()
 
@@ -35,35 +39,6 @@ def remove_none(obj):
         )
     else:
         return obj
-
-
-def get_zabbix_connection(zbx_url, zbx_user, zbx_password):
-    """
-    Sometimes pyzabbix and py-zabbix library can replace each other.
-    This is a wrapper, we don't care about what pip-module we install.
-    Return ZabbixAPI object
-    """
-    # pyzabbix library, with user\password in login method. It's GOOD library
-    logging.debug("Try connect to Zabbix by pyzabbix...")
-    try:
-        zbx_pyzabbix = ZabbixAPI(zbx_url)
-        zbx_pyzabbix.session.verify = False
-        zbx_pyzabbix.login(zbx_user, zbx_password)
-        return zbx_pyzabbix
-    except Exception as e:
-        logging.exception(e)
-
-    # py-zabbix library, with user\password in ZabbixAPI
-    logging.debug("Try connect to Zabbix by py-zabbix...")
-    try:
-        zbx_py_zabbix = ZabbixAPI(zbx_url, user=zbx_user, password=zbx_password)
-        zbx_py_zabbix.session.verify = False
-        return zbx_py_zabbix
-    except Exception as e:
-        logging.exception(e)
-    # choose good API
-
-    raise Exception("Some error in pyzabbix or py_zabbix module, see logs")
 
 
 def order_data(data):
@@ -177,24 +152,66 @@ def dump_xml(object, txt, name, directory, save_yaml=False):
         file.write(txt)
 
 
-def main(zabbix_, save_yaml, directory, only="all"):
+DEFAULT_EXTERNAL_SCRIPTS_DIR = "/usr/lib/zabbix/externalscripts"
+
+
+def get_external_scripts_dir(server_config, override=None):
+    """
+    Resolve the ExternalScripts directory: explicit override wins, else parse
+    'ExternalScripts=' out of the Zabbix server config file, else fall back to
+    the Zabbix-packaged default.
+    """
+    if override:
+        logging.debug("Using explicit external scripts dir: {}".format(override))
+        return override
+
+    if server_config and os.path.isfile(server_config):
+        try:
+            with open(server_config, "r", encoding="utf-8") as f:
+                for line in f:
+                    m = re.match(r"^\s*ExternalScripts\s*=\s*(.+?)\s*$", line)
+                    if m:
+                        logging.debug(
+                            "Using ExternalScripts dir from '{}': {}".format(
+                                server_config, m.group(1)
+                            )
+                        )
+                        return m.group(1)
+        except OSError as e:
+            logging.warning("Could not read '{}': {}".format(server_config, e))
+
+    logging.debug(
+        "Using default external scripts dir: {}".format(DEFAULT_EXTERNAL_SCRIPTS_DIR)
+    )
+    return DEFAULT_EXTERNAL_SCRIPTS_DIR
+
+
+def main(
+    zabbix_,
+    save_yaml,
+    directory,
+    only="all",
+    server_config=None,
+    external_scripts_dir_override=None,
+):
     # XML
     # Standart zabbix xml export via API
-    def export(zabbix_api, type, itemid, name):
+    def export(zabbix_api, options_key, itemid, name, folder=None):
         """
-        Export one type: hosts, template, screen or other
-        https://www.zabbix.com/documentation/4.0/manual/api/reference/configuration/export
+        Export one type: hosts, templates, host/template groups, maps, ...
+        https://www.zabbix.com/documentation/current/en/manual/api/reference/configuration/export
         """
-        logging.info("Export {}".format(type))
+        folder = folder or options_key
+        logging.info("Export {}".format(folder))
         items = zabbix_api.get()
         for item in items:
             logging.debug("Processing {}...".format(item[name]))
             try:
                 txt = zabbix_.configuration.export(
-                    format="xml", options={type: [item[itemid]]}
+                    format="xml", options={options_key: [item[itemid]]}
                 )
                 dump_xml(
-                    object=type,
+                    object=folder,
                     txt=txt,
                     name=item[name],
                     save_yaml=save_yaml,
@@ -206,21 +223,27 @@ def main(zabbix_, save_yaml, directory, only="all"):
                 )
                 logging.error(e)
 
-    api_version = parse_version(zabbix_.apiinfo.version())
+    api_version = zabbix_.api_version
     logging.debug("Source Zabbix server version: {}".format(api_version))
 
     if yaml:
         logging.info("Convert all format to yaml")
 
     logging.info("Start export XML part...")
-    if only in ("all", "groups"):
-        export(zabbix_.hostgroup, "groups", "groupid", "name")
+    if only in ("all", "hostgroups"):
+        export(zabbix_.hostgroup, "host_groups", "groupid", "name", folder="hostgroups")
+    if only in ("all", "templategroups"):
+        export(
+            zabbix_.templategroup,
+            "template_groups",
+            "groupid",
+            "name",
+            folder="templategroups",
+        )
     if only in ("all", "hosts"):
         export(zabbix_.host, "hosts", "hostid", "name")
     if only in ("all", "templates"):
         export(zabbix_.template, "templates", "templateid", "name")
-    if only in ("all", "valuemaps"):
-        export(zabbix_.valuemap, "valueMaps", "valuemapid", "name")
     if only in ("all", "maps"):
         export(zabbix_.map, "maps", "sysmapid", "name")
 
@@ -235,7 +258,6 @@ def main(zabbix_, save_yaml, directory, only="all"):
         "users",
         "actions",
         "dashboards",
-        "screens",
         "usermacro",
     ):
         logging.info("Processing mediatypes...")
@@ -244,30 +266,17 @@ def main(zabbix_, save_yaml, directory, only="all"):
             "0": "__ALL__"
         }  # key: mediatypeid, value: mediatype name
         for mt in mediatypes:
-            if api_version <= parse_version("4.4"):
-                mediatypeid2mediatype[mt["mediatypeid"]] = mt["description"]
-            else:
-                mediatypeid2mediatype[mt["mediatypeid"]] = mt["name"]
+            mediatypeid2mediatype[mt["mediatypeid"]] = mt["name"]
 
         if only in ("all", "mediatypes"):
-            if api_version <= parse_version("4.4"):
-                dumps_json(
-                    object="mediatypes",
-                    data=mediatypes,
-                    key="description",
-                    save_yaml=save_yaml,
-                    directory=directory,
-                    drop_keys=["mediatypeid"],
-                )
-            else:
-                dumps_json(
-                    object="mediatypes",
-                    data=mediatypes,
-                    key="name",
-                    save_yaml=save_yaml,
-                    directory=directory,
-                    drop_keys=["mediatypeid"],
-                )
+            dumps_json(
+                object="mediatypes",
+                data=mediatypes,
+                key="name",
+                save_yaml=save_yaml,
+                directory=directory,
+                drop_keys=["mediatypeid"],
+            )
 
     if only in ("all", "images"):
         logging.info("Processing images...")
@@ -280,24 +289,34 @@ def main(zabbix_, save_yaml, directory, only="all"):
             drop_keys=["imageid"],
         )
 
-    if only in ("all", "usergroups", "screens", "actions", "dashboards", "usermacro"):
+    if only in ("all", "usergroups", "actions", "dashboards", "usermacro"):
         logging.info("Processing usergroups...")
-        usergroups = zabbix_.usergroup.get(selectRights="extend")
+        usergroups = zabbix_.usergroup.get(
+            selectHostGroupRights="extend", selectTemplateGroupRights="extend"
+        )
         usergroupid2usergroup = {}  # key: usergroupid, value: usergroup name
         for ug in usergroups:
             usergroupid2usergroup[ug["usrgrpid"]] = ug["name"]
 
-        # existing hostgroups
+        # existing host/template groups
         result = zabbix_.hostgroup.get(output=["groupid", "name"])
         groupid2group = {}  # key: groupid, value: group name
         for group in result:
             groupid2group[group["groupid"]] = group["name"]
+        result = zabbix_.templategroup.get(output=["groupid", "name"])
+        tgroupid2tgroup = {}  # key: groupid, value: group name
+        for group in result:
+            tgroupid2tgroup[group["groupid"]] = group["name"]
 
-        # resolve hostgroupids:
+        # resolve hostgroupids/templategroupids:
         for usergroup in usergroups:
-            usergroup["rights"] = [
+            usergroup["hostgroup_rights"] = [
                 {"id": groupid2group[r["id"]], "permission": r["permission"]}
-                for r in usergroup["rights"]
+                for r in usergroup["hostgroup_rights"]
+            ]
+            usergroup["templategroup_rights"] = [
+                {"id": tgroupid2tgroup[r["id"]], "permission": r["permission"]}
+                for r in usergroup["templategroup_rights"]
             ]
 
         if only in ("all", "usergroups"):
@@ -309,12 +328,12 @@ def main(zabbix_, save_yaml, directory, only="all"):
                 drop_keys=["usrgrpid"],
             )
 
-    if only in ("all", "users", "screens", "actions", "dashboards", "usermacro"):
+    if only in ("all", "users", "actions", "dashboards", "usermacro"):
         logging.info("Processing users...")
         users = zabbix_.user.get(selectMedias="extend", selectUsrgrps="extend")
-        userid2user = {}  # key: userid, value: user alias
+        userid2user = {}  # key: userid, value: username
         for u in users:
-            userid2user[u["userid"]] = u["alias"]
+            userid2user[u["userid"]] = u["username"]
             for ug in u["usrgrps"]:
                 ug.pop("usrgrpid", None)
             for m in u["medias"]:
@@ -328,7 +347,7 @@ def main(zabbix_, save_yaml, directory, only="all"):
             dumps_json(
                 object="users",
                 data=users,
-                key="alias",
+                key="username",
                 save_yaml=save_yaml,
                 directory=directory,
                 drop_keys=["userid", "attempt_clock", "attempt_failed", "attempt_ip"],
@@ -336,14 +355,16 @@ def main(zabbix_, save_yaml, directory, only="all"):
 
     if only in ("all", "proxy"):
         logging.info("Processing proxy...")
-        proxys = zabbix_.proxy.get(selectInterface="extend")
+        proxys = zabbix_.proxy.get()
+        # Zabbix 7.0 renamed the proxy "host" field to "name"
+        proxy_name_key = "name" if (proxys and "name" in proxys[0]) else "host"
         dumps_json(
             object="proxy",
             data=proxys,
-            key="host",
+            key=proxy_name_key,
             save_yaml=save_yaml,
             directory=directory,
-            drop_keys=["lastaccess", "proxyid"],
+            drop_keys=["lastaccess", "last_access", "proxyid"],
         )
 
     if only in ("all", "globalmacro"):
@@ -391,8 +412,8 @@ def main(zabbix_, save_yaml, directory, only="all"):
             drop_keys=["maintenanceid"],
         )
 
-    if only in ("all", "screens", "dashboards"):
-        logging.info("Processing screens...")
+    if only in ("all", "dashboards"):
+        logging.info("Processing dashboard lookup tables...")
 
         graphid2graph = {}  # key: graphid, value: "hostname,graphname"
         graphs = zabbix_.graph.get(
@@ -434,70 +455,13 @@ def main(zabbix_, save_yaml, directory, only="all"):
                     gp["hosts"][0]["name"], gp["name"]
                 )
 
-        screens = zabbix_.screen.get(
-            selectUsers="extend", selectUserGroups="extend", selectScreenItems="extend"
-        )
-        for screen in screens:
-            # resolve users/usergroups/screenitems:
-            screen["userid"] = userid2user[screen["userid"]]
-            screen["users"] = [
-                {
-                    "permission": user["permission"],
-                    "userid": userid2user[user["userid"]],
-                }
-                for user in screen["users"]
-            ]
-            screen["userGroups"] = [
-                {
-                    "permission": group["permission"],
-                    "usrgrpid": usergroupid2usergroup[group["usrgrpid"]],
-                }
-                for group in screen["userGroups"]
-            ]
-            for si in screen["screenitems"]:
-                si.pop("screenid", None)
-                si.pop("screenitemid", None)
-                if si["resourcetype"] == "0":  # graph
-                    si["resourceid"] = graphid2graph[si["resourceid"]]
-                elif si["resourcetype"] == "1":  # simple graph
-                    si["resourceid"] = itemid2item[si["resourceid"]]
-                elif si["resourcetype"] == "2":  # map
-                    pass
-                elif si["resourcetype"] == "3":  # plain text
-                    pass  # FIXME
-                elif si["resourcetype"] == "5":  # triggers info
-                    pass
-                elif si["resourcetype"] == "8":  # screen
-                    pass
-                elif si["resourcetype"] == "9":  # triggers overview
-                    pass
-                elif si["resourcetype"] == "10":  # data overview
-                    si["resourceid"] = groupid2group[si["resourceid"]]
-                elif si["resourcetype"] == "14":  # latest host group issues
-                    pass
-                elif si["resourcetype"] == "16":  # latest host issues
-                    pass
-                elif si["resourcetype"] == "19":  # simple graph prototype
-                    si["resourceid"] = itemid2proto[si["resourceid"]]
-                elif si["resourcetype"] == "20":  # graph prototype
-                    si["resourceid"] = graphid2proto[si["resourceid"]]
-
-        if only in ("all", "screens"):
-            dumps_json(
-                object="screens",
-                data=screens,
-                save_yaml=save_yaml,
-                directory=directory,
-                drop_keys=["screenid"],
-            )
-
     if only in ("all", "actions", "usermacro"):
         logging.info("Processing action...")
         actions = zabbix_.action.get(
             selectOperations="extend",
             selectFilter="extend",
             selectRecoveryOperations="extend",
-            selectAcknowledgeOperations="extend",
+            selectUpdateOperations="extend",
         )
         # existing templates
         result = zabbix_.template.get(output=["host", "templateid"])
@@ -529,15 +493,9 @@ def main(zabbix_, save_yaml, directory, only="all"):
             )  # sort to stabilize dumps
             action["filter"]["formula"] = action["filter"]["eval_formula"]
             action["filter"].pop("eval_formula", None)
-            action["recovery_operations"] = action.pop(
-                "recoveryOperations"
-            )  # rename key for easy import
-            action["acknowledge_operations"] = action.pop(
-                "acknowledgeOperations"
-            )  # rename key for easy import
             for action_type in (
                 "operations",
-                "acknowledge_operations",
+                "update_operations",
                 "recovery_operations",
             ):
                 for op in action[action_type]:
@@ -605,13 +563,23 @@ def main(zabbix_, save_yaml, directory, only="all"):
 
     if only in ("all", "usermacro"):
         logging.info("Processing user macros...")
-        user_macros = zabbix_.usermacro.get()
-        # resolve hostids:
-        for umacro in user_macros:
-            try:
+        # usermacro.get() also returns host-prototype macros, which live in a
+        # separate ID namespace from hosts/templates and aren't exported here.
+        user_macros = []
+        for umacro in zabbix_.usermacro.get():
+            if umacro["hostid"] in hostid2host:
                 umacro["hostid"] = hostid2host[umacro["hostid"]]
-            except KeyError:
+            elif umacro["hostid"] in templateid2template:
                 umacro["hostid"] = templateid2template[umacro["hostid"]]
+            else:
+                logging.warning(
+                    "Skipping usermacro '{}' on unresolvable hostid {} "
+                    "(likely a host prototype macro, not exported)".format(
+                        umacro["macro"], umacro["hostid"]
+                    )
+                )
+                continue
+            user_macros.append(umacro)
         dumps_json(
             object="usermacro",
             data=user_macros,
@@ -624,7 +592,7 @@ def main(zabbix_, save_yaml, directory, only="all"):
     if only in ("all", "dashboards"):
         logging.info("Processing dashboards...")
         dashboards = zabbix_.dashboard.get(
-            selectWidgets="extend", selectUsers="extend", selectUserGroups="extend"
+            selectPages="extend", selectUsers="extend", selectUserGroups="extend"
         )
         for d in dashboards:
             d["userid"] = userid2user[d["userid"]]
@@ -632,20 +600,22 @@ def main(zabbix_, save_yaml, directory, only="all"):
                 u["userid"] = userid2user[u["userid"]]
             for ug in d["userGroups"]:
                 ug["usrgrpid"] = usergroupid2usergroup[ug["usrgrpid"]]
-            for w in d["widgets"]:
-                w.pop("widgetid", None)
-                w["fields"] = sorted(
-                    w["fields"], key=lambda i: i["name"]
-                )  # sort to stabilize dumps
-                for f in w["fields"]:
-                    if f["type"] == "4":  # item
-                        f["value"] = itemid2item[f["value"]]
-                    elif f["type"] == "5":  # item prototype
-                        f["value"] = itemid2proto[f["value"]]
-                    elif f["type"] == "6":  # graph
-                        f["value"] = graphid2graph[f["value"]]
-                    elif f["type"] == "7":  # graph prototype
-                        f["value"] = graphid2proto[f["value"]]
+            for page in d["pages"]:
+                page.pop("dashboard_pageid", None)
+                for w in page["widgets"]:
+                    w.pop("widgetid", None)
+                    w["fields"] = sorted(
+                        w["fields"], key=lambda i: i["name"]
+                    )  # sort to stabilize dumps
+                    for f in w["fields"]:
+                        if f["type"] == "4":  # item
+                            f["value"] = itemid2item[f["value"]]
+                        elif f["type"] == "5":  # item prototype
+                            f["value"] = itemid2proto[f["value"]]
+                        elif f["type"] == "6":  # graph
+                            f["value"] = graphid2graph[f["value"]]
+                        elif f["type"] == "7":  # graph prototype
+                            f["value"] = graphid2proto[f["value"]]
 
         dumps_json(
             object="dashboards",
@@ -655,36 +625,58 @@ def main(zabbix_, save_yaml, directory, only="all"):
             drop_keys=["dashboardid"],
         )
 
+    if only in ("all", "scripts"):
+        logging.info("Processing scripts...")
+        # Two distinct things reference files in Zabbix's ExternalScripts directory:
+        # - "External check" items/item prototypes (type 10), key_ = "scriptname[params]"
+        # - Alerts > Scripts entries of type "Script" (type 0), command = filename
+        # Both are gathered here; only the former is normally what's actually used.
+        EXTERNAL_CHECK_TYPE = "10"
+        script_names = set()
 
-def environ_or_required(key):
-    "Argparse environment vars helper"
-    if os.environ.get(key):
-        return {"default": os.environ.get(key)}
-    else:
-        return {"required": True}
+        for i in zabbix_.item.get(
+            output=["key_"], filter={"type": EXTERNAL_CHECK_TYPE}
+        ):
+            script_names.add(i["key_"].split("[", 1)[0])
+        for i in zabbix_.itemprototype.get(
+            output=["key_"], filter={"type": EXTERNAL_CHECK_TYPE}
+        ):
+            script_names.add(i["key_"].split("[", 1)[0])
+
+        scripts = zabbix_.script.get(output="extend")
+        for script in scripts:
+            if str(script.get("type")) == "0":  # file-backed "Script" type
+                script_names.add(script["command"])
+
+        external_scripts_dir = get_external_scripts_dir(
+            server_config, external_scripts_dir_override
+        )
+        dst_dir = os.path.join(directory, "scripts", "files")
+        if not os.path.exists(dst_dir):
+            os.makedirs(dst_dir)
+        for name in sorted(script_names):
+            src = os.path.join(external_scripts_dir, name)
+            dst = os.path.join(dst_dir, os.path.basename(name))
+            try:
+                shutil.copyfile(src, dst)
+            except OSError as e:
+                logging.warning(
+                    "Could not copy external script file '{}': {}".format(src, e)
+                )
+
+        dumps_json(
+            object="scripts",
+            data=scripts,
+            save_yaml=save_yaml,
+            directory=directory,
+            drop_keys=["scriptid"],
+        )
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument(
-        "--zabbix-url",
-        action="store",
-        help="REQUIRED. May be in ZABBIX_URL env var",
-        **environ_or_required("ZABBIX_URL")
-    )
-    parser.add_argument(
-        "--zabbix-username",
-        action="store",
-        help="REQUIRED. May be in ZABBIX_USERNAME env var",
-        **environ_or_required("ZABBIX_USERNAME")
-    )
-    parser.add_argument(
-        "--zabbix-password",
-        action="store",
-        help="REQUIRED. May be in ZABBIX_PASSWORD env var",
-        **environ_or_required("ZABBIX_PASSWORD")
-    )
+    add_zabbix_connection_args(parser)
 
     parser.add_argument(
         "--directory",
@@ -702,13 +694,28 @@ def parse_args():
     parser.add_argument("--debug", action="store_true", help="Show debug output")
 
     parser.add_argument(
+        "--zabbix-server-config",
+        action="store",
+        default="/etc/zabbix/zabbix_server.conf",
+        help="Path to zabbix_server.conf, used to resolve the ExternalScripts directory "
+        "for 'scripts' export. Default: %(default)s",
+    )
+    parser.add_argument(
+        "--external-scripts-dir",
+        action="store",
+        default=None,
+        help="Explicit path to the ExternalScripts directory, overrides "
+        "--zabbix-server-config detection",
+    )
+
+    parser.add_argument(
         "--only",
         choices=[
             "all",
             "hosts",
-            "groups",
+            "hostgroups",
+            "templategroups",
             "templates",
-            "valuemaps",
             "maps",
             "mediatypes",
             "images",
@@ -717,22 +724,18 @@ def parse_args():
             "proxy",
             "globalmacro",
             "maintenances",
-            "screens",
             "actions",
             "usermacro",
             "dashboards",
+            "scripts",
         ],
         default="all",
         help="Only object type that will be exported, default is %(default)s",
     )
 
     args = parser.parse_args()
+    validate_zabbix_connection_args(parser, args)
     return args
-
-
-def init_logging(level):
-    logger_format_string = "%(asctime)s %(levelname)-8s %(message)s"
-    logging.basicConfig(level=level, format=logger_format_string, stream=sys.stdout)
 
 
 if __name__ == "__main__":
@@ -743,7 +746,7 @@ if __name__ == "__main__":
     init_logging(level=level)
 
     zabbix_ = get_zabbix_connection(
-        args.zabbix_url, args.zabbix_username, args.zabbix_password
+        args.zabbix_url, args.zabbix_username, args.zabbix_password, args.zabbix_token
     )
 
     logging.info("All files will be save in {}".format(os.path.abspath(args.directory)))
@@ -752,4 +755,6 @@ if __name__ == "__main__":
         save_yaml=args.save_yaml,
         directory=args.directory,
         only=args.only,
+        server_config=args.zabbix_server_config,
+        external_scripts_dir_override=args.external_scripts_dir,
     )

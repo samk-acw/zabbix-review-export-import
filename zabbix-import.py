@@ -8,11 +8,17 @@ import urllib3
 
 import yaml
 
-from pyzabbix import ZabbixAPI, ZabbixAPIException
+from zabbix_common import (
+    ZabbixAPIException,
+    add_zabbix_connection_args,
+    get_zabbix_connection,
+    init_logging,
+    validate_zabbix_connection_args,
+)
 from pprint import pformat
 import random
 import string
-from pkg_resources import parse_version
+from packaging.version import parse as parse_version
 
 urllib3.disable_warnings()
 
@@ -23,49 +29,20 @@ def randompassword():
     )
 
 
-def get_zabbix_connection(zbx_url, zbx_user, zbx_password):
-    """
-    Sometimes pyzabbix and py-zabbix library can replace each other.
-    This is a wrapper, we don't care about what pip-module we install.
-    Return ZabbixAPI object
-    """
-    # pyzabbix library, with user\password in login method. It's GOOD library
-    logging.debug("Try connect to Zabbix by pyzabbix...")
-    try:
-        zbx_pyzabbix = ZabbixAPI(zbx_url)
-        zbx_pyzabbix.session.verify = False
-        zbx_pyzabbix.login(zbx_user, zbx_password)
-        return zbx_pyzabbix
-    except Exception as e:
-        logging.exception(e)
-
-    # py-zabbix library, with user\password in ZabbixAPI
-    logging.debug("Try connect to Zabbix by py-zabbix...")
-    try:
-        zbx_py_zabbix = ZabbixAPI(zbx_url, user=zbx_user, password=zbx_password)
-        zbx_py_zabbix.session.verify = False
-        return zbx_py_zabbix
-    except Exception as e:
-        logging.exception(e)
-    # choose good API
-
-    raise Exception("Some error in pyzabbix or py_zabbix module, see logs")
-
-
 def guess_yaml_type(yml, xml_exported=False):
-    "Return string of guessed YAML file type (group, host, ...)"
+    "Return string of guessed YAML file type (hostgroup, host, ...)"
     try:
         if xml_exported:
-            if "groups" in yml and "templates" not in yml and "hosts" not in yml:
-                return "group"
+            if "template_groups" in yml and "templates" not in yml:
+                return "templategroup"
+            if "host_groups" in yml and "templates" not in yml and "hosts" not in yml:
+                return "hostgroup"
             if "templates" in yml:
                 return "template"
             if "maps" in yml:
                 return "map"
             if "hosts" in yml:
                 return "host"
-            if "value_maps" in yml:
-                return "valuemap"
         else:
             if yml.keys() >= {"algorithm", "goodsla"}:
                 return "service"
@@ -73,7 +50,7 @@ def guess_yaml_type(yml, xml_exported=False):
                 return "proxy"
             if yml.keys() >= {"maintenance_type"}:
                 return "maintenance"
-            if yml.keys() >= {"alias"}:
+            if yml.keys() >= {"username"}:
                 return "user"
             if yml.keys() >= {"exec_path"}:
                 return "mediatype"
@@ -87,9 +64,7 @@ def guess_yaml_type(yml, xml_exported=False):
                 return "globalmacro"
             if yml.keys() >= {"imagetype"}:
                 return "image"
-            if yml.keys() >= {"hsize", "vsize"}:
-                return "screen"
-            if yml.keys() >= {"widgets"}:
+            if yml.keys() >= {"pages"}:
                 return "dashboard"
     except Exception as e:
         logging.error(e)
@@ -107,6 +82,16 @@ def get_hostgroups_cache(zabbix):
     return group2groupid
 
 
+def get_templategroups_cache(zabbix):
+    "Returns dict groupname=>groupid or None on error"
+    result = zabbix.templategroup.get(output=["groupid", "name"])
+    logging.debug(pformat(result))
+    tgroup2tgroupid = {}  # key: group name, value: groupid
+    for group in result:
+        tgroup2tgroupid[group["name"]] = int(group["groupid"])
+    return tgroup2tgroupid
+
+
 def get_template_cache(zabbix):
     "Return dict templatename=>templateid or None on error"
     result = zabbix.template.get(output=["templateid", "host"])
@@ -119,10 +104,11 @@ def get_template_cache(zabbix):
 
 def get_proxy_cache(zabbix):
     "Return dict proxyname=>proxyid or None on error"
-    result = zabbix.proxy.get(output=["proxyid", "host"])
+    result = zabbix.proxy.get()
     proxy2proxyid = {}  # key: proxy name, value: proxyid
     for proxy in result:
-        proxy2proxyid[proxy["host"]] = int(proxy["proxyid"])
+        # Zabbix 7.0 renamed the proxy "host" field to "name"
+        proxy2proxyid[proxy.get("name", proxy.get("host"))] = int(proxy["proxyid"])
     return proxy2proxyid
 
 
@@ -146,29 +132,20 @@ def get_usergroup_cache(zabbix):
 
 def get_users_cache(zabbix):
     "Return dict username=>userid or None on error"
-    result = zabbix.user.get(output=["alias", "userid"])
-    user2userid = {}  # key: user alias, value: userid
+    result = zabbix.user.get(output=["username", "userid"])
+    user2userid = {}  # key: username, value: userid
     for u in result:
-        user2userid[u["alias"]] = int(u["userid"])
+        user2userid[u["username"]] = int(u["userid"])
     return user2userid
 
 
 def get_mediatype_cache(zabbix):
     "Return dict mediatype=>mediatypeid or None on error"
-    result = zabbix.mediatype.get(output=["description", "mediatypeid"])
+    result = zabbix.mediatype.get(output=["name", "mediatypeid"])
     mediatype2mediatypeid = {"__ALL__": "0"}  # key: mediatype name, value: mediatypeid
     for mt in result:
-        mediatype2mediatypeid[mt["description"]] = int(mt["mediatypeid"])
+        mediatype2mediatypeid[mt["name"]] = int(mt["mediatypeid"])
     return mediatype2mediatypeid
-
-
-def get_screen_cache(zabbix):
-    "Return dict screen name=>screenid or None on error"
-    result = zabbix.screen.get(output=["name", "screenid"])
-    screen2screenid = {}  # key: screen name, value: screenid
-    for sc in result:
-        screen2screenid[sc["name"]] = int(sc["screenid"])
-    return screen2screenid
 
 
 def get_action_cache(zabbix):
@@ -218,15 +195,6 @@ def get_globalmacro_cache(zabbix):
             "value": gm["value"],
         }
     return globalmacro2globalmacroid
-
-
-def get_valuemap_cache(zabbix):
-    "Return dict valuemap name=>{valuemapid, name}"
-    result = zabbix.valuemap.get()
-    valuemap2valuemapid = {}  # key: valuemap name, value: valuemapid
-    for vm in result:
-        valuemap2valuemapid[vm["name"]] = vm["valuemapid"]
-    return valuemap2valuemapid
 
 
 def get_graph_cache(zabbix):
@@ -299,7 +267,7 @@ def get_maint_cache(zabbix):
 
 def import_group(zabbix, yml, group2groupid):
     "Import hostgroup from YAML. Return created object, None on error, True if object already exist"
-    g = yml["groups"]["group"]
+    g = yml["host_groups"]["host_group"]
     if g["name"] in group2groupid:
         return True  # skip existing objects
 
@@ -316,24 +284,15 @@ def import_group(zabbix, yml, group2groupid):
     return result
 
 
-def import_proxy(zabbix, yml, proxy2proxyid):
-    "Import proxy form YAML. Return created object, None on error, True if object already exists"
-    if yml["host"] in proxy2proxyid:
+def import_templategroup(zabbix, yml, tgroup2tgroupid):
+    "Import template group from YAML. Return created object, None on error, True if object already exist"
+    g = yml["template_groups"]["template_group"]
+    if g["name"] in tgroup2tgroupid:
         return True  # skip existing objects
 
     result = None
     try:
-        result = zabbix.proxy.create(
-            host=yml["host"],
-            status=yml["status"],
-            description=yml["description"],
-            tls_accept=yml["tls_accept"],
-            tls_connect=yml["tls_connect"],
-            tls_issuer=yml["tls_issuer"],
-            tls_psk=yml["tls_psk"],
-            tls_psk_identity=yml["tls_psk_identity"],
-            tls_subject=yml["tls_subject"],
-        )
+        result = zabbix.templategroup.create(name=g["name"])
         logging.debug(pformat(result))
     except ZabbixAPIException as e:
         if "already exist" in str(e):
@@ -342,6 +301,59 @@ def import_proxy(zabbix, yml, proxy2proxyid):
             logging.error(e)
             result = False
     return result
+
+
+def import_proxy(zabbix, yml, proxy2proxyid):
+    "Import proxy from YAML. Return created object, None on error, True if object already exists"
+    name = yml.get("name", yml.get("host"))
+    if name in proxy2proxyid:
+        return True  # skip existing objects
+
+    # Pass through whichever fields are present in the source YAML, so this
+    # works whether the export came from Zabbix 7.0+ (name/operating_mode)
+    # or an older export re-imported (host/status).
+    fields = {}
+    for key in (
+        "name",
+        "host",
+        "status",
+        "operating_mode",
+        "description",
+        "address",
+        "port",
+        "local_address",
+        "local_port",
+        "allowed_addresses",
+        "tls_accept",
+        "tls_connect",
+        "tls_issuer",
+        "tls_psk",
+        "tls_psk_identity",
+        "tls_subject",
+    ):
+        if key in yml:
+            fields[key] = yml[key]
+
+    result = None
+    try:
+        result = zabbix.proxy.create(fields)
+        logging.debug(pformat(result))
+    except ZabbixAPIException as e:
+        if "already exist" in str(e):
+            result = True
+        else:
+            logging.error(e)
+            result = False
+    return result
+
+
+def _item_tags(item):
+    "Normalize an item's 'tags' block (if any) into a list of {tag, value} dicts"
+    if "tags" not in item:
+        return []
+    if isinstance(item["tags"]["tag"], dict):
+        item["tags"]["tag"] = [item["tags"]["tag"]]
+    return [{"tag": t["tag"], "value": t.get("value", "")} for t in item["tags"]["tag"]]
 
 
 def import_host(
@@ -448,25 +460,6 @@ def import_host(
             {}
         )  # key: item key, value: itemid (will be used for dependent items and graph prototypes)
 
-        if "applications" not in host:
-            host["applications"] = {"application": []}
-        if isinstance(host["applications"]["application"], dict):
-            host["applications"]["application"] = [host["applications"]["application"]]
-        apps = zabbix.application.get(
-            hostids=new_hostid, output=["name", "applicationid"]
-        )
-        app2id = {}  # key: app name, value: app id
-        for app in apps:
-            app2id[app["name"]] = app["applicationid"]
-        for app in host["applications"]["application"]:
-            if app["name"] not in app2id:
-                new_app = zabbix.application.create(
-                    name=app["name"], hostid=new_hostid
-                )  # create missed apps
-                app2id[app["name"]] = new_app["applicationids"][
-                    0
-                ]  # save new app id for future use in items
-
         if "items" in host or "discovery_rules" in host:
             # hack: use default interface for items
             iface = zabbix.hostinterface.get(
@@ -558,13 +551,7 @@ def import_host(
 
             # create non-dependent items:
             for item in filter(lambda x: x["type"] != 18, host["items"]["item"]):
-                if "applications" in item:
-                    if isinstance(item["applications"]["application"], dict):
-                        item["applications"]["application"] = [
-                            item["applications"]["application"]
-                        ]
-                else:
-                    item["applications"] = {"application": []}
+                tags = _item_tags(item)
                 if "preprocessing" in item:
                     if isinstance(item["preprocessing"]["step"], dict):
                         item["preprocessing"]["step"] = [item["preprocessing"]["step"]]
@@ -602,10 +589,7 @@ def import_host(
                         if "snmp_community" in item
                         else "",
                         "snmp_oid": item["snmp_oid"] if "snmp_oid" in item else "",
-                        "applications": [
-                            app2id[x["name"]]
-                            for x in item["applications"]["application"]
-                        ],
+                        "tags": tags,
                         "preprocessing": item["preprocessing"]["step"]
                         if "preprocessing" in item
                         else [],
@@ -620,13 +604,7 @@ def import_host(
 
             # create dependent items:
             for item in filter(lambda x: x["type"] == 18, host["items"]["item"]):
-                if "applications" in item:
-                    if isinstance(item["applications"]["application"], dict):
-                        item["applications"]["application"] = [
-                            item["applications"]["application"]
-                        ]
-                else:
-                    item["applications"] = {"application": []}
+                tags = _item_tags(item)
                 if "preprocessing" in item:
                     if isinstance(item["preprocessing"]["step"], dict):
                         item["preprocessing"]["step"] = [item["preprocessing"]["step"]]
@@ -665,10 +643,7 @@ def import_host(
                         if "snmp_community" in item
                         else "",
                         "snmp_oid": item["snmp_oid"] if "snmp_oid" in item else "",
-                        "applications": [
-                            app2id[x["name"]]
-                            for x in item["applications"]["application"]
-                        ],
+                        "tags": tags,
                         "preprocessing": item["preprocessing"]["step"]
                         if "preprocessing" in item
                         else [],
@@ -761,17 +736,7 @@ def import_host(
                                 "step"
                             ]
 
-                        if "applications" in item_prot:
-                            if isinstance(
-                                item_prot["applications"]["application"], dict
-                            ):
-                                item_prot["applications"]["application"] = [
-                                    item_prot["applications"]["application"]
-                                ]
-                            item_prot["applications"] = [
-                                app2id[app["name"]]
-                                for app in item_prot["applications"]["application"]
-                            ]  # resolve applications
+                        item_prot["tags"] = _item_tags(item_prot)
                         zabbix.itemprototype.create(item_prot)
 
                 if "trigger_prototypes" in rule:
@@ -861,7 +826,7 @@ def import_host(
     return result
 
 
-def import_template(zabbix, yml, group2groupid, template2templateid):
+def import_template(zabbix, yml, tgroup2tgroupid, template2templateid):
     "Import template from YAML. Return created object, None on error, True if object already exists"
     result = None
     try:
@@ -869,15 +834,15 @@ def import_template(zabbix, yml, group2groupid, template2templateid):
         if new_template["template"] in template2templateid:
             return True  # skip existing objects
 
-        # set groupid(s) for new template:
+        # set groupid(s) for new template (these are template groups, not host groups):
         if isinstance(new_template["groups"]["group"], dict):
             groups = [
-                {"groupid": group2groupid[new_template["groups"]["group"]["name"]]}
+                {"groupid": tgroup2tgroupid[new_template["groups"]["group"]["name"]]}
             ]
         else:
             groups = []
             for group in new_template["groups"]["group"]:
-                groups.append({"groupid": group2groupid[group["name"]]})
+                groups.append({"groupid": tgroup2tgroupid[group["name"]]})
 
         # set templateid(s) for linked template(s):
         if "templates" in new_template:
@@ -926,7 +891,6 @@ def import_template(zabbix, yml, group2groupid, template2templateid):
         # TODO/FIXME:
         # - items
         # - graphs
-        # - screens
         # - triggers
         # - discovery_rules (including item/trigger/graph prototypes)
 
@@ -953,40 +917,40 @@ def import_template(zabbix, yml, group2groupid, template2templateid):
     return result
 
 
-def import_usergroup(zabbix, yml, group2groupid, usergroup2usergroupid):
+def import_usergroup(
+    zabbix, yml, group2groupid, tgroup2tgroupid, usergroup2usergroupid
+):
     "Import usergroup from YAML. Return created object , None on error, True if object already exists"
     if yml["name"] in usergroup2usergroupid:
         return True  # skip existing objects
 
     result = None
     try:
-        # set rights for new usergroup:
-        if "rights" in yml:
-            if isinstance(yml["rights"], dict):
-                rights = [
-                    {
-                        "id": yml["rights"]["id"],
-                        "permission": yml["rights"]["permission"],
-                    }
-                ]
-            else:
-                rights = []
-                for r in yml["rights"]:
-                    rights.append(
-                        {
-                            "id": group2groupid[r["id"]],
-                            "permission": r["permission"],
-                        }
-                    )
-        else:
-            rights = []
+        # resolve host/template group rights:
+        def _resolve_rights(rights, groupid_map):
+            if not rights:
+                return []
+            if isinstance(rights, dict):
+                rights = [rights]
+            return [
+                {"id": groupid_map[r["id"]], "permission": r["permission"]}
+                for r in rights
+            ]
+
+        hostgroup_rights = _resolve_rights(
+            yml.get("hostgroup_rights", []), group2groupid
+        )
+        templategroup_rights = _resolve_rights(
+            yml.get("templategroup_rights", []), tgroup2tgroupid
+        )
 
         result = zabbix.usergroup.create(
             name=yml["name"],
             debug_mode=yml["debug_mode"] if "debug_mode" in yml else 0,
             gui_access=yml["gui_access"] if "gui_access" in yml else 0,
             users_status=yml["users_status"] if "users_status" in yml else 0,
-            rights=rights,
+            hostgroup_rights=hostgroup_rights,
+            templategroup_rights=templategroup_rights,
         )
     except ZabbixAPIException as e:
         if "already exist" in str(e):
@@ -1019,7 +983,7 @@ def import_action(
         # resolve template/group/mediatype/usergroup/host names:
         for action_type in (
             "operations",
-            "acknowledge_operations",
+            "update_operations",
             "recovery_operations",
         ):
             for op in yml[action_type]:
@@ -1104,7 +1068,7 @@ def import_action(
 
 def import_user(zabbix, yml, usergroup2usergroupid, user2userid, mediatype2mediatypeid):
     "Import user from YAML. Return created object, None on error, True if object already exists"
-    if yml["alias"] in user2userid:
+    if yml["username"] in user2userid:
         return True  # skip existing objects
 
     result = None
@@ -1125,7 +1089,7 @@ def import_user(zabbix, yml, usergroup2usergroupid, user2userid, mediatype2media
 
         result = zabbix.user.create(
             {
-                "alias": yml["alias"],
+                "username": yml["username"],
                 "autologin": yml["autologin"] if "autologin" in yml else 0,
                 "autologout": yml["autologout"] if "autologout" in yml else "15m",
                 "lang": yml["lang"] if "lang" in yml else "en_GB",
@@ -1134,115 +1098,13 @@ def import_user(zabbix, yml, usergroup2usergroupid, user2userid, mediatype2media
                 "refresh": yml["refresh"] if "refresh" in yml else "30s",
                 "rows_per_page": yml["rows_per_page"] if "rows_per_page" in yml else 50,
                 "theme": yml["theme"] if "theme" in yml else "default",
-                "type": yml["type"] if "type" in yml else 1,
+                # "type" was replaced by "roleid" (user roles); only set it if the
+                # source export has one, since default roleids aren't stable across instances
+                **({"roleid": yml["roleid"]} if "roleid" in yml else {}),
                 "url": yml["url"] if "url" in yml else "",
                 "passwd": randompassword(),  # YAML dump dont contains passwords/hashes
                 "usrgrps": groups,
                 "user_medias": medias,
-            }
-        )
-    except ZabbixAPIException as e:
-        if "already exist" in str(e):
-            result = True
-        else:
-            result = None
-            logging.exception(e)
-    return result
-
-
-def import_screen(
-    zabbix,
-    yml,
-    screen2screenid,
-    user2userid,
-    usergroup2usergroupid,
-    graph2graphid,
-    item2itemid,
-    itemproto2itemid,
-    graphproto2itemid,
-    group2groupid,
-):
-    "Import screen from YAML. Return created object, None on error, True if object already exists"
-    if yml["name"] in screen2screenid:
-        return True  # skip existing objects
-
-    result = None
-    try:
-        # resolve userids:
-        resolved_users = [
-            {"permission": u["permission"], "userid": user2userid[u["userid"]]}
-            for u in yml["users"]
-        ]
-        # resolve usrgrpids:
-        resolved_grps = [
-            {
-                "permission": g["permission"],
-                "usrgrpid": usergroup2usergroupid[g["usrgrpid"]],
-            }
-            for g in yml["userGroups"]
-        ]
-        # render screen items:
-        screenitems = []
-        for si in yml["screenitems"]:
-            if si["resourcetype"] == 0:  # graph
-                si["resourceid"] = graph2graphid[si["resourceid"]]
-            elif si["resourcetype"] == 1:  # simple graph
-                si["resourceid"] = item2itemid[si["resourceid"]]
-            elif si["resourcetype"] == 2:  # map
-                pass
-            elif si["resourcetype"] == 3:  # plain text
-                pass  # FIXME
-            elif si["resourcetype"] == 5:  # triggers info
-                pass
-            elif si["resourcetype"] == 8:  # screen
-                pass
-            elif si["resourcetype"] == 9:  # triggers overview
-                pass
-            elif si["resourcetype"] == 10:  # data overview
-                si["resourceid"] = group2groupid[si["resourceid"]]
-            elif si["resourcetype"] == 14:  # latest host group issues
-                pass
-            elif si["resourcetype"] == 16:  # latest host issues
-                pass
-            elif si["resourcetype"] == 19:  # simple graph prototype
-                si["resourceid"] = itemproto2itemid[si["resourceid"]]
-            elif si["resourcetype"] == 20:  # graph prototype
-                si["resourceid"] = graphproto2itemid[si["resourceid"]]
-
-            screenitems.append(
-                {
-                    "resourcetype": si["resourcetype"],
-                    "application": si["application"] if "application" in si else "",
-                    "colspan": si["colspan"] if "colspan" in si else 1,
-                    "dynamic": si["dynamic"] if "dynamic" in si else 0,
-                    "elements": si["elements"] if "elements" in si else 25,
-                    "halign": si["halign"] if "halign" in si else 0,
-                    "height": si["height"] if "height" in si else 200,
-                    "max_columns": si["max_columns"] if "max_columns" in si else 3,
-                    "resourceid": si["resourceid"],
-                    "rowspan": si["rowspan"] if "rowspan" in si else 1,
-                    "sort_triggers": si["sort_triggers"]
-                    if "sort_triggers" in si
-                    else 0,
-                    "style": si["style"] if "style" in si else 0,
-                    "url": si["url"] if "url" in si else "",
-                    "valign": si["valign"] if "valign" in si else 0,
-                    "width": si["width"] if "width" in si else 320,
-                    "x": si["x"] if "x" in si else 0,
-                    "y": si["y"] if "y" in si else 0,
-                }
-            )
-
-        result = zabbix.screen.create(
-            {
-                "name": yml["name"],
-                "hsize": yml["hsize"],
-                "vsize": yml["vsize"],
-                "users": resolved_users,
-                "userGroupyml": resolved_grps,
-                "userid": user2userid[yml["userid"]],
-                "private": yml["private"],
-                "screenitems": screenitems,
             }
         )
     except ZabbixAPIException as e:
@@ -1316,37 +1178,7 @@ def import_globalmacro(zabbix, yml, globalmacro2globalmacroid):
     return result
 
 
-def import_valuemap(zabbix, yml, valuemap2valuemapid):
-    "Import valuemap from YAML. Return created object, None on error, True if object already exists"
-
-    result = None
-    try:
-        if isinstance(yml["value_maps"], dict):
-            yml["value_maps"] = [yml["value_maps"]]
-        for vmap in yml["value_maps"]:
-            vm = vmap["value_map"]
-            if vm["name"] in valuemap2valuemapid:
-                result = True
-            else:
-                mappings = []
-                if isinstance(vm["mappings"]["mapping"], dict):
-                    vm["mappings"]["mapping"] = [vm["mappings"]["mapping"]]
-                for m in vm["mappings"]["mapping"]:
-                    mappings.append(
-                        {"value": str(m["value"]), "newvalue": str(m["newvalue"])}
-                    )
-                result = zabbix.valuemap.create(name=vm["name"], mappings=mappings)
-    except ZabbixAPIException as e:
-        if "already exist" in str(e):
-            result = True
-        else:
-            result = None
-            logging.exception(e)
-    return result
-
-
 def import_dashboard(
-    api_version,
     zabbix,
     yml,
     dashboard2id,
@@ -1365,53 +1197,11 @@ def import_dashboard(
             u["userid"] = user2userid[u["userid"]]
         for ug in yml["userGroups"]:
             ug["usrgrpid"] = usergroup2usergroupid[ug["usrgrpid"]]
-        for w in yml["widgets"]:
-            for f in w["fields"]:
-                if f["name"] == "graphid":
-                    f["value"] = graph2graphid[f["value"]]
-
-            if api_version >= parse_version("4.0"):
-                if w["type"] == "stszbx":
-                    w["type"] = "systeminfo"
-                elif w["type"] == "actlog":
-                    w["type"] = "actionlog"
-                elif w["type"] == "dscvry":
-                    w["type"] = "discovery"
-                elif w["type"] == "favgrph":
-                    w["type"] = "favgraphs"
-                elif w["type"] == "favmap":
-                    w["type"] = "favmaps"
-                elif w["type"] == "favscr":
-                    w["type"] = "favscreens"
-                elif w["type"] == "sysmap":
-                    w["type"] = "map"
-                elif w["type"] == "navigationtree":
-                    w["type"] = "navtree"
-                elif w["type"] == "syssum":
-                    w["type"] = "systeminfo"
-                elif w["type"] == "webovr":
-                    w["type"] = "web"
-            elif api_version < parse_version("4.0"):
-                if w["type"] == "systeminfo":
-                    w["type"] = "stszbx"
-                elif w["type"] == "actionlog":
-                    w["type"] = "actlog"
-                elif w["type"] == "discovery":
-                    w["type"] = "dscvry"
-                elif w["type"] == "favgraphs":
-                    w["type"] = "favgrph"
-                elif w["type"] == "favmaps":
-                    w["type"] = "favmap"
-                elif w["type"] == "favscreens":
-                    w["type"] = "favscr"
-                elif w["type"] == "map":
-                    w["type"] = "sysmap"
-                elif w["type"] == "navtree":
-                    w["type"] = "navigationtree"
-                elif w["type"] == "systeminfo":
-                    w["type"] = "syssum"
-                elif w["type"] == "web":
-                    w["type"] = "webovr"
+        for page in yml["pages"]:
+            for w in page["widgets"]:
+                for f in w["fields"]:
+                    if f["name"] == "graphid":
+                        f["value"] = graph2graphid[f["value"]]
 
         result = zabbix.dashboard.create(yml)
     except ZabbixAPIException as e:
@@ -1454,18 +1244,17 @@ def main(
     file_type,
     api_version,
     group_cache,
+    tgroup_cache,
     template_cache,
     proxy_cache,
     host_cache,
     usergroup_cache,
     users_cache,
     mediatype_cache,
-    screen_cache,
     action_cache,
     trigger_cache,
     usermacro_cache,
     globalmacro_cache,
-    valuemap_cache,
     graph_cache,
     item_cache,
     itemproto_cache,
@@ -1511,10 +1300,12 @@ def main(
         logging.info("Guessed file type: {}".format(file_type))
 
     try:
-        if file_type == "group":
+        if file_type == "hostgroup":
             op_result = import_group(zabbix_, yml, group_cache)
+        elif file_type == "templategroup":
+            op_result = import_templategroup(zabbix_, yml, tgroup_cache)
         elif file_type == "template":
-            op_result = import_template(zabbix_, yml, group_cache, template_cache)
+            op_result = import_template(zabbix_, yml, tgroup_cache, template_cache)
         elif file_type == "proxy":
             op_result = import_proxy(zabbix_, yml, proxy_cache)
         elif file_type == "host":
@@ -1528,23 +1319,12 @@ def main(
                 host_cache,
             )
         elif file_type == "usergroup":
-            op_result = import_usergroup(zabbix_, yml, group_cache, usergroup_cache)
+            op_result = import_usergroup(
+                zabbix_, yml, group_cache, tgroup_cache, usergroup_cache
+            )
         elif file_type == "user":
             op_result = import_user(
                 zabbix_, yml, usergroup_cache, users_cache, mediatype_cache
-            )
-        elif file_type == "screen":
-            op_result = import_screen(
-                zabbix_,
-                yml,
-                screen_cache,
-                users_cache,
-                usergroup_cache,
-                graph_cache,
-                item_cache,
-                itemproto_cache,
-                graphproto_cache,
-                group_cache,
             )
         elif file_type == "action":
             op_result = import_action(
@@ -1566,11 +1346,8 @@ def main(
             )
         elif file_type == "globalmacro":
             op_result = import_globalmacro(zabbix_, yml, globalmacro_cache)
-        elif file_type == "valuemap":
-            op_result = import_valuemap(zabbix_, yml, valuemap_cache)
         elif file_type == "dashboard":
             op_result = import_dashboard(
-                api_version,
                 zabbix_,
                 yml,
                 dashboard_cache,
@@ -1600,47 +1377,21 @@ def main(
     return op_result
 
 
-def environ_or_required(key):
-    "Argparse environment vars helper"
-    if os.environ.get(key):
-        return {"default": os.environ.get(key)}
-    else:
-        return {"required": True}
-
-
 def parse_args():
     "Return parsed CLI args"
     parser = argparse.ArgumentParser(description="Import Zabbix object from YAML dump")
     parser.add_argument("--debug", action="store_true", help="Show debug output")
 
-    parser.add_argument(
-        "--zabbix-url",
-        action="store",
-        help="REQUIRED. May be in ZABBIX_URL env var",
-        **environ_or_required("ZABBIX_URL")
-    )
-    parser.add_argument(
-        "--zabbix-username",
-        action="store",
-        help="REQUIRED. May be in ZABBIX_USERNAME env var",
-        **environ_or_required("ZABBIX_USERNAME")
-    )
-    parser.add_argument(
-        "--zabbix-password",
-        action="store",
-        help="REQUIRED. May be in ZABBIX_PASSWORD env var",
-        **environ_or_required("ZABBIX_PASSWORD")
-    )
+    add_zabbix_connection_args(parser)
 
     parser.add_argument(
         "--type",
         choices=[
             "autoguess",
             "host",
-            "group",
+            "hostgroup",
+            "templategroup",
             "template",
-            "valuemap",
-            "screen",
             "map",
             "service",
             "maintenance",
@@ -1660,13 +1411,8 @@ def parse_args():
     parser.add_argument("FILE", help="YAML file to import from", nargs="+")
 
     args = parser.parse_args()
+    validate_zabbix_connection_args(parser, args)
     return args
-
-
-def init_logging(level):
-    "Initialize logging"
-    logger_format_string = "%(asctime)s %(levelname)-8s %(message)s"
-    logging.basicConfig(level=level, format=logger_format_string, stream=sys.stdout)
 
 
 if __name__ == "__main__":
@@ -1677,29 +1423,28 @@ if __name__ == "__main__":
     init_logging(level=level)
 
     zabbix_ = get_zabbix_connection(
-        args.zabbix_url, args.zabbix_username, args.zabbix_password
+        args.zabbix_url, args.zabbix_username, args.zabbix_password, args.zabbix_token
     )
 
     result = True  # Total success indicator
 
     try:
-        api_version = parse_version(zabbix_.apiinfo.version())
+        api_version = zabbix_.api_version
         logging.debug("Destination Zabbix server version: {}".format(api_version))
 
         # Fill caches:
         group2groupid = {}
+        tgroup2tgroupid = {}
         template2templateid = {}
         proxy2proxyid = {}
         host2hostid = {}
         usergroup2usergroupid = {}
         user2userid = {}
         mediatype2mediatypeid = {}
-        screen2screenid = {}
         action2actionid = {}
         trigger2triggerid = {}
         usermacro2hostmacroid = {}
         globalmacro2globalmacroid = {}
-        valuemap2valuemapid = {}
         graph2graphid = {}
         item2itemid = {}
         itemproto2itemid = {}
@@ -1710,15 +1455,15 @@ if __name__ == "__main__":
         # load only needed caches:
         if args.type in (
             "autoguess",
-            "group",
+            "hostgroup",
             "host",
-            "template",
             "usergroup",
             "action",
-            "screen",
             "maintenance",
         ):
             group2groupid = get_hostgroups_cache(zabbix_)
+        if args.type in ("autoguess", "templategroup", "template", "usergroup"):
+            tgroup2tgroupid = get_templategroups_cache(zabbix_)
         if args.type in ("autoguess", "host", "template", "action", "usermacro"):
             template2templateid = get_template_cache(zabbix_)
         if args.type in ("autoguess", "proxy", "host"):
@@ -1730,16 +1475,14 @@ if __name__ == "__main__":
             "usergroup",
             "action",
             "user",
-            "screen",
             "dashboard",
         ):
             usergroup2usergroupid = get_usergroup_cache(zabbix_)
-        if args.type in ("autoguess", "action", "user", "screen", "dashboard"):
+        if args.type in ("autoguess", "action", "user", "dashboard"):
             user2userid = get_users_cache(zabbix_)
         if args.type in ("autoguess", "action", "user"):
             mediatype2mediatypeid = get_mediatype_cache(zabbix_)
-        if args.type in ("autoguess", "screen", "dashboard"):
-            screen2screenid = get_screen_cache(zabbix_)
+        if args.type in ("autoguess", "dashboard"):
             graph2graphid = get_graph_cache(zabbix_)
             item2itemid = get_item_cache(zabbix_)
             itemproto2itemid = get_itemproto_cache(zabbix_)
@@ -1751,8 +1494,6 @@ if __name__ == "__main__":
             usermacro2hostmacroid = get_usermacro_cache(zabbix_)
         if args.type in ("autoguess", "globalmacro"):
             globalmacro2globalmacroid = get_globalmacro_cache(zabbix_)
-        if args.type in ("autoguess", "valuemap"):
-            valuemap2valuemapid = get_valuemap_cache(zabbix_)
         if args.type in ("autoguess", "dashboard"):
             dashboard2id = get_dashboard_cache(zabbix_)
         if args.type in ("autoguess", "maintenance"):
@@ -1770,18 +1511,17 @@ if __name__ == "__main__":
                 file_type=args.type,
                 api_version=api_version,
                 group_cache=group2groupid,
+                tgroup_cache=tgroup2tgroupid,
                 template_cache=template2templateid,
                 proxy_cache=proxy2proxyid,
                 host_cache=host2hostid,
                 usergroup_cache=usergroup2usergroupid,
                 users_cache=user2userid,
                 mediatype_cache=mediatype2mediatypeid,
-                screen_cache=screen2screenid,
                 action_cache=action2actionid,
                 trigger_cache=trigger2triggerid,
                 usermacro_cache=usermacro2hostmacroid,
                 globalmacro_cache=globalmacro2globalmacroid,
-                valuemap_cache=valuemap2valuemapid,
                 graph_cache=graph2graphid,
                 item_cache=item2itemid,
                 itemproto_cache=itemproto2itemid,

@@ -17,13 +17,30 @@ autodetected, but may be pointed manually (it is much faster for single-file imp
 - [Screenshots](#screenshots)
 
 # Requirements
-- Installed [Python >=3.4](https://www.python.org/downloads/)
+- Installed [Python >=3.8](https://www.python.org/downloads/)
+- A Zabbix server **6.0 through 7.4+**. Older versions are not supported: Zabbix removed the
+  Applications API and the Screens API in 5.4 (replaced by item tags and dashboards), so those
+  code paths are gone from this tool rather than kept as dead weight.
 
 
 If you want use [review (or Monitoring as Code](#make-review):
 - [GitLab](https://gitlab.com/) - you own instance with configured [GitLab CI](https://docs.gitlab.com/ee/ci/) or cloud account
 - `git`
 
+
+## Authentication
+Either an API token, or a username/password pair:
+```bash
+# API token (Users -> API tokens in the Zabbix UI, or the `token.create` API method)
+export ZABBIX_TOKEN="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# or username/password
+export ZABBIX_USERNAME="user.name"
+export ZABBIX_PASSWORD="secret"
+```
+Both scripts also accept `--zabbix-token` / `--zabbix-username` / `--zabbix-password` directly.
+Against Zabbix 7.0+ the token is sent as an `Authorization: Bearer` header; against 6.x it's sent
+in the request body, matching what each server version actually supports.
 
 ## Make export and backup
 It's simple to start use this script as backup mechanism:
@@ -36,20 +53,40 @@ python -mpip install -r requirements.txt
 python ./zabbix-export.py --help
 
 # backup to current folder, save XML and JSON
-python ./zabbix-export.py --zabbix-url https://zabbix.example.com --zabbix-username user --zabbix-password password
+python ./zabbix-export.py --zabbix-url https://zabbix.example.com --zabbix-token xxxx
 
 # backup only hosts in YAML format
-python ./zabbix-export.py --save-yaml --zabbix-url https://zabbix.example.com --zabbix-username user --zabbix-password password --only hosts
+python ./zabbix-export.py --save-yaml --zabbix-url https://zabbix.example.com --zabbix-token xxxx --only hosts
 
 # backup to custom folder in YAML format
-python ./zabbix-export.py --save-yaml --directory /home/username/path/to/zabbix-yaml --zabbix-url https://zabbix.example.com --zabbix-username user --zabbix-password password
+python ./zabbix-export.py --save-yaml --directory /home/username/path/to/zabbix-yaml --zabbix-url https://zabbix.example.com --zabbix-token xxxx
 ```
+
+### Exporting external scripts
+Two distinct Zabbix features reference files in the server's `ExternalScripts` directory (set by
+`ExternalScripts=` in `zabbix_server.conf`, default `/usr/lib/zabbix/externalscripts`) rather than
+storing the script body in the database:
+- **External check** items/item prototypes (`key_` like `check_oracle.sh["-h","{HOST.CONN}"]`) —
+  in most setups this is what's actually populating that directory.
+- Alerts -> Scripts entries of type "Script" (as opposed to Webhook/SSH/IPMI/Telnet, which are
+  fully stored in the database already).
+
+`--only scripts` scans hosts, templates and LLD rules for external-check items, plus the Scripts
+table for type-"Script" entries, and copies every referenced file it can find alongside the
+Scripts table's JSON dump:
+```bash
+# --zabbix-server-config defaults to /etc/zabbix/zabbix_server.conf; override with
+# --external-scripts-dir if the ExternalScripts path isn't discoverable from there
+python ./zabbix-export.py --zabbix-url https://zabbix.example.com --zabbix-token xxxx --only scripts
+```
+Files land in `<directory>/scripts/files/`. A script whose file can't be found or read is logged
+as a warning and skipped — it doesn't fail the rest of the export.
+
 ## Restore from YAML dump
 Few examples:
 ```bash
 export ZABBIX_URL="https://zabbix.instan.ce"
-export ZABBIX_USERNAME="user.name"
-export ZABBIX_PASSWORD="secret"
+export ZABBIX_TOKEN="xxxx"
 
 ./zabbix-import.py /path/to/file.yaml
 
@@ -77,18 +114,29 @@ Create empty merge request `develop=>master` after merge and receive notificatio
 To answer for the question "Who make this changes?" you need use [Zabbix Audit](https://www.zabbix.com/documentation/4.0/manual/web_interface/frontend_sections/reports/audit). It's difficult but possible.
 
 ## Supported objects
-Use standard [zabbix export functional](https://www.zabbix.com/documentation/4.0/manual/api/reference/configuration/export):
+Use standard [zabbix export functional](https://www.zabbix.com/documentation/current/en/manual/api/reference/configuration/export):
 - hosts
 - templates
-- screen
+- host groups
+- template groups
+- maps
 
 Representing objects as JSON using the API:
-- mediatypes
-- actions
+- mediatypes, images, usergroups, users, proxy, globalmacro, maintenances, actions, usermacro,
+  dashboards, scripts (including the referenced external-script files, see above)
+
+## Breaking changes from previous versions of this tool
+- Targets Zabbix 6.0+ only; screens and applications are gone (both removed server-side in 5.4).
+- Host groups and template groups export to separate `hostgroups/`/`templategroups/` folders
+  instead of a combined `groups/` folder, mirroring Zabbix 6.2's own split of the two.
+- Standalone value-map export/import is gone; value maps are scoped to a host/template as of
+  Zabbix 6.4 and are already embedded in that host's/template's own export.
 
 ## Known issues
 - [ZBX-15175](https://support.zabbix.com/browse/ZBX-15175): Zabbix export - host's xml does not contain overrides or diff to templates (e.g. item's storage period, trigger.priority, trigger.status=disables\enabled)
 - [ZBXNEXT-4862](https://support.zabbix.com/browse/ZBXNEXT-4862): The implementation of functionality in Zabbix. Zabbix configuration as code - save XML in git repository
+- Host/item-prototype import carries over item `tags` (the replacement for the old
+  `applications` grouping) but doesn't attempt any other reconciliation of tag data.
 
 
 ## Screenshots

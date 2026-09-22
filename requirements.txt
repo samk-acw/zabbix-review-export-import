@@ -1,4 +1,4 @@
-pyzabbix
 requests
 pyyaml
 anymarkup
+packaging
