@@ -11,6 +11,7 @@ from collections import OrderedDict
 import anymarkup
 import urllib3
 import yaml
+from packaging.version import parse as parse_version
 
 from zabbix_common import (
     add_zabbix_connection_args,
@@ -650,10 +651,12 @@ def main(
             output=["key_"], filter={"type": EXTERNAL_CHECK_TYPE}
         ):
             script_names.add(i["key_"].split("[", 1)[0])
-        for i in zabbix_.discoveryruleprototype.get(
-            output=["key_"], filter={"type": EXTERNAL_CHECK_TYPE}
-        ):
-            script_names.add(i["key_"].split("[", 1)[0])
+        if api_version >= parse_version("7.4"):
+            # discoveryruleprototype (nested LLD) was only added in Zabbix 7.4
+            for i in zabbix_.discoveryruleprototype.get(
+                output=["key_"], filter={"type": EXTERNAL_CHECK_TYPE}
+            ):
+                script_names.add(i["key_"].split("[", 1)[0])
 
         scripts = zabbix_.script.get(output="extend")
 
